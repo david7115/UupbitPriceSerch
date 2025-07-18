@@ -91,7 +91,14 @@ if selected_markets:
                 with col1:
                     st.metric(label="현재가", value=f"{current_price:,.0f} 원", delta=f"{change_rate:+.2f}%")
                 with col2:
-                    qty = st.number_input(f"{coin_name} 보유 수량", min_value=0.0, value=holdings[market], step=0.01, key=f"{market}_qty")
+                    qty = st.number_input(
+    f"{coin_name} 보유 수량",
+    min_value=0.0,
+    value=float(holdings[market]),  # <-- float으로 변환
+    step=0.01,
+    key=f"{market}_qty"
+)
+
                     holdings[market] = qty
                     st.write(f"💼 평가금액: `{qty * current_price:,.0f}` 원")
 
