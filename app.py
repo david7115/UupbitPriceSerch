@@ -3,73 +3,87 @@ import requests
 from datetime import datetime
 import time
 
-# 페이지 설정
+# Streamlit 페이지 설정
 st.set_page_config(page_title="업비트 코인 실시간 시세조회 _ Wis David", page_icon="📈")
 
-# 제목
 st.title("💹 업비트 코인 실시간 시세조회 _ Wis David")
-st.markdown("업비트 Open API를 활용한 실시간 시세 확인 웹앱입니다.")
+st.markdown("업비트 Open API를 통해 실시간으로 코인 가격을 조회합니다.")
 
-# 코인 선택
-coin = st.selectbox(
-    "📌 조회할 코인을 선택하세요:",
-    options=["KRW-BTC", "KRW-ETH", "KRW-ONDO"]
+# ✅ 1. 업비트 마켓 목록 불러오기 (KRW 마켓만)
+@st.cache_data(ttl=3600)
+def get_markets():
+    url = "https://api.upbit.com/v1/market/all"
+    try:
+        res = requests.get(url)
+        res.raise_for_status()
+        markets = res.json()
+        krw_markets = [m for m in markets if m['market'].startswith("KRW-")]
+        return {
+            m['market']: m['korean_name']
+            for m in krw_markets
+        }
+    except:
+        return {}
+
+markets_dict = get_markets()
+
+# ✅ 2. 사용자 선택: 복수 선택
+selected_markets = st.multiselect(
+    "✅ 조회할 코인을 선택하세요 (KRW 마켓):",
+    options=list(markets_dict.keys()),
+    format_func=lambda x: f"{markets_dict[x]} ({x})",
+    default=["KRW-BTC", "KRW-ETH"]
 )
 
-# 시세 불러오기 함수
+# ✅ 3. 시간 및 시세 표시 구역
+time_placeholder = st.empty()
+cols = st.columns(len(selected_markets)) if selected_markets else []
+
+# ✅ 4. 이전 가격 저장용
+prev_prices = {m: None for m in selected_markets}
+
+# ✅ 5. 시세 불러오기 함수
 def get_price(market):
     url = "https://api.upbit.com/v1/ticker"
     params = {"markets": market}
     try:
         res = requests.get(url, params=params)
         res.raise_for_status()
-        data = res.json()[0]
-        return {
-            "현재가": data["trade_price"],
-            "고가": data["high_price"],
-            "저가": data["low_price"],
-            "24시간 거래량": data["acc_trade_volume_24h"]
-        }
+        return res.json()[0]
     except:
         return None
 
-# 표시 영역 만들기
-time_box = st.empty()
-price_box = st.empty()
-diff_box = st.empty()
-
-# 시세 비교를 위한 변수
-prev_price = None
-
-# 자동 갱신 루프
+# ✅ 6. 자동 갱신 루프
 while True:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    time_box.markdown(f"🕒 **현재 시간:** `{now}`")
+    time_placeholder.markdown(f"🕒 **현재 시간:** `{now}`")
 
-    data = get_price(coin)
+    for i, market in enumerate(selected_markets):
+        data = get_price(market)
+        with cols[i]:
+            st.markdown(f"### {markets_dict.get(market, market)}")
+            if data:
+                current = data["trade_price"]
+                previous = prev_prices[market]
+                diff = None
+                arrow = ""
 
-    if data:
-        current_price = data["현재가"]
+                if previous is not None:
+                    diff = current - previous
+                    if diff > 0:
+                        arrow = "🔺"
+                    elif diff < 0:
+                        arrow = "🔻"
+                    else:
+                        arrow = "⏺️"
 
-        # 현재가 표시
-        price_box.metric(
-            label=f"💰 현재가 ({coin})",
-            value=f"{current_price:,.0f} 원"
-        )
-
-        # 전 가격과 비교
-        if prev_price is not None:
-            diff = current_price - prev_price
-            arrow = "🔺" if diff > 0 else ("🔻" if diff < 0 else "⏺️")
-            diff_text = f"{arrow} {abs(diff):,.0f} 원"
-            diff_box.markdown(f"**가격 변화:** {diff_text}")
-        else:
-            diff_box.markdown("🔄 가격 변화: 데이터 수집 중...")
-
-        prev_price = current_price
-
-    else:
-        price_box.error("시세 정보를 가져올 수 없습니다.")
-        diff_box.empty()
+                st.metric(
+                    label="현재가",
+                    value=f"{current:,.0f} 원",
+                    delta=f"{arrow} {abs(diff):,.0f} 원" if diff is not None else "수집 중..."
+                )
+                prev_prices[market] = current
+            else:
+                st.error("시세 정보 불러오기 실패")
 
     time.sleep(1)
