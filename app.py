@@ -1,316 +1,500 @@
-import streamlit as st
+"""
+Upbit Open API Python client — REST + WebSocket (v1)
+
+✅ 포함 기능(공식 문서 기준)
+- 시세(호가/체결/캔들/티커) 조회: /v1/orderbook, /v1/trades/ticks, /v1/candles/*, /v1/ticker, /v1/ticker/all
+- 마켓 목록: /v1/market/all
+- 자산/계좌: /v1/accounts
+- 주문 사전 정보: /v1/orders/chance
+- 주문/취소/조회: /v1/orders (POST), /v1/order (DELETE), /v1/orders/open, /v1/orders/closed, /v1/orders/uuids
+- 입금/출금: (조회/주소발급/입금확인/출금요청 등 주요 엔드포인트 래핑)
+- WebSocket(퍼블릭: ticker/trade/orderbook/candle, 프라이빗: myOrder/myAsset, 구독목록):
+  wss://api.upbit.com/websocket/v1
+
+⚠️ 안전장치
+- enable_trading=False(기본값) 인 경우, 주문/취소/출금 계열 메서드는 호출 시 예외를 발생시킵니다.
+- 실제 키를 환경변수 또는 인자로 주입하세요. (ACCESS_KEY, SECRET_KEY)
+- 주문/출금은 법/내부통제/리스크 정책을 반드시 준수하세요.
+
+필요 패키지
+    pip install requests PyJWT websocket-client
+
+참고
+- 모든 사설(서명) 요청은 JWT(HS256) + query_hash(SHA512) 를 사용합니다.
+- POST/DELETE 포함, 파라미터가 존재하는 요청은 query_hash를 포함해야 합니다.
+- WebSocket 프라이빗 스트림(myOrder/myAsset)은 동일한 Authorization 헤더를 사용합니다.
+
+작성: 2025-08-20
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import time
+import uuid
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union, Callable
+
+import jwt  # PyJWT
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from datetime import datetime
-import pandas as pd
-import plotly.graph_objs as go
-from typing import Dict, List, Tuple
+from urllib.parse import urlencode
 
-# =============================
-# 페이지/테마 설정
-# =============================
-st.set_page_config(
-    page_title="업비트 코인 실시간 시세조회 _ Wis David (리팩토링)",
-    page_icon="📈",
-    layout="wide"
-)
+try:
+    import websocket  # websocket-client
+except Exception:  # pragma: no cover
+    websocket = None  # type: ignore
 
-st.markdown(
+
+class UpbitAPIError(RuntimeError):
+    def __init__(self, status_code: int, payload: Any):
+        self.status_code = status_code
+        self.payload = payload
+        message = f"Upbit API Error {status_code}: {payload}"
+        super().__init__(message)
+
+
+@dataclass
+class UpbitClientConfig:
+    access_key: Optional[str] = None
+    secret_key: Optional[str] = None
+    base_url: str = "https://api.upbit.com"  # 지역에 따라 sg-api.upbit.com 등으로 변경 가능
+    enable_trading: bool = False  # 주문/취소/출금 등 위험 동작 보호
+    timeout: int = 30
+    user_agent: str = (
+        "UpbitPythonClient/1.0 (+https://github.com/)"
+    )
+
+
+class UpbitClient:
+    """Upbit Open API v1 Python Client (REST + WebSocket)
+
+    공식 문서에 맞춰 주요 엔드포인트를 메서드로 래핑했습니다.
+    - 사설 요청: JWT(HS256) + query_hash(SHA512)
+    - 퍼블릭 요청: 서명 불필요
     """
-    <h2 style="font-size:28px; margin-bottom:0;">💹 업비트 코인 실시간 시세조회 _ Wis David</h2>
-    <p style="font-size:14px; color:gray;">실시간 시세, 등락률, 포트폴리오 계산기, 캔들차트(+MA/거래량), 자동 새로고침, 안정적인 API 호출</p>
-    """,
-    unsafe_allow_html=True,
-)
 
-# =============================
-# HTTP 세션 (재시도/타임아웃)
-# =============================
-@st.cache_resource(show_spinner=False)
-def get_session() -> requests.Session:
-    s = requests.Session()
-    retries = Retry(
-        total=3,
-        backoff_factor=0.3,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retries)
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
-    s.headers.update({
-        "Accept": "application/json",
-        "User-Agent": "wis-david-streamlit/1.0"
-    })
-    return s
-
-SESSION = get_session()
-API_BASE = "https://api.upbit.com/v1"
-
-# =============================
-# 유틸
-# =============================
-def fmt_number(x: float) -> str:
-    try:
-        return f"{x:,.0f}"
-    except Exception:
-        return "-"
-
-# =============================
-# 데이터 소스
-# =============================
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_markets() -> Dict[str, str]:
-    url = f"{API_BASE}/market/all"
-    try:
-        res = SESSION.get(url, timeout=5)
-        res.raise_for_status()
-        markets = res.json()
-        return {m["market"]: m["korean_name"] for m in markets if m["market"].startswith("KRW-")}
-    except Exception as e:
-        st.error(f"마켓 목록 조회 실패: {e}")
-        return {}
-
-@st.cache_data(ttl=30, show_spinner=False)
-def get_candles(market: str, chart_type: str, unit: int | None, count: int = 120) -> pd.DataFrame:
-    if chart_type == "minutes":
-        url = f"{API_BASE}/candles/minutes/{unit}"
-    elif chart_type == "days":
-        url = f"{API_BASE}/candles/days"
-    elif chart_type == "weeks":
-        url = f"{API_BASE}/candles/weeks"
-    elif chart_type == "months":
-        url = f"{API_BASE}/candles/months"
-    else:
-        return pd.DataFrame()
-
-    try:
-        res = SESSION.get(url, params={"market": market, "count": count}, timeout=7)
-        res.raise_for_status()
-        candles = res.json()
-        candles.reverse()  # 오래된 -> 최신 순
-        df = pd.DataFrame({
-            "시간": [c.get("candle_date_time_kst") for c in candles],
-            "시가": [c.get("opening_price") for c in candles],
-            "고가": [c.get("high_price") for c in candles],
-            "저가": [c.get("low_price") for c in candles],
-            "종가": [c.get("trade_price") for c in candles],
-            "거래량": [c.get("candle_acc_trade_volume") for c in candles],
+    def __init__(self, config: Optional[UpbitClientConfig] = None, **kwargs):
+        if config is None:
+            config = UpbitClientConfig(**kwargs)
+        # 환경변수 fallback
+        self.access_key = config.access_key or os.getenv("UPBIT_ACCESS_KEY")
+        self.secret_key = config.secret_key or os.getenv("UPBIT_SECRET_KEY")
+        self.base_url = config.base_url.rstrip("/")
+        self.enable_trading = bool(config.enable_trading)
+        self.timeout = int(config.timeout)
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": config.user_agent,
+            "Accept": "application/json",
         })
-        # 시간 파싱
-        try:
-            df["시간"] = pd.to_datetime(df["시간"])  # KST 문자열 -> datetime(naive)
-        except Exception:
-            pass
-        return df
-    except Exception as e:
-        st.warning(f"캔들 조회 실패({market}): {e}")
-        return pd.DataFrame()
 
-@st.cache_data(ttl=3, show_spinner=False)
-def get_tickers_batch(markets: List[str]) -> pd.DataFrame:
-    if not markets:
-        return pd.DataFrame()
-    url = f"{API_BASE}/ticker"
-    try:
-        markets_param = ",".join(markets)
-        res = SESSION.get(url, params={"markets": markets_param}, timeout=5)
-        res.raise_for_status()
-        data = res.json()
-        rows = []
-        for item in data:
-            rows.append({
-                "market": item.get("market"),
-                "현재가": item.get("trade_price"),
-                "전일종가": item.get("prev_closing_price"),
-                "등락률(%)": ((item.get("trade_price") - item.get("prev_closing_price")) / item.get("prev_closing_price")) * 100 if item.get("prev_closing_price") else None,
-                "누적거래대금": item.get("acc_trade_price_24h"),
-                "누적거래량": item.get("acc_trade_volume_24h"),
+    # =============== 내부 유틸 ===============
+    def _jwt_headers(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+        if not self.access_key or not self.secret_key:
+            raise RuntimeError("사설 요청에는 access_key/secret_key가 필요합니다.")
+
+        payload = {
+            "access_key": self.access_key,
+            "nonce": str(uuid.uuid4()),
+        }
+        if params:
+            # Upbit는 'query string' 을 SHA512로 해시하여 query_hash로 포함
+            # dict -> stable query string (키 정렬 + doseq)
+            q = urlencode(sorted(self._flatten(params).items()), doseq=True)
+            query_hash = hashlib.sha512(q.encode()).hexdigest()
+            payload.update({
+                "query_hash": query_hash,
+                "query_hash_alg": "SHA512",
             })
-        return pd.DataFrame(rows)
-    except Exception as e:
-        st.warning(f"시세 조회 실패: {e}")
-        return pd.DataFrame()
+        token = jwt.encode(payload, self.secret_key, algorithm="HS256")
+        return {"Authorization": f"Bearer {token}"}
 
-# =============================
-# 인터벌/맵
-# =============================
-interval_map: Dict[str, Tuple[str, int | None]] = {
-    "1분": ("minutes", 1),
-    "3분": ("minutes", 3),
-    "5분": ("minutes", 5),
-    "10분": ("minutes", 10),
-    "30분": ("minutes", 30),
-    "1시간": ("minutes", 60),
-    "일": ("days", None),
-    "주": ("weeks", None),
-    "월": ("months", None),
-}
-
-# =============================
-# 사이드바: 옵션/자동 새로고침
-# =============================
-with st.sidebar:
-    st.subheader("⚙️ 옵션")
-    interval_label = st.selectbox("🕰️ 차트 주기", list(interval_map.keys()), index=0)
-    chart_type, unit = interval_map[interval_label]
-    candle_count = st.slider("캔들 개수", min_value=30, max_value=200, value=120, step=10)
-
-    st.divider()
-    st.subheader("🔁 자동 새로고침")
-    refresh_sec = st.number_input("새로고침 간격(초)", min_value=0, max_value=300, value=0, step=1, help="0이면 자동 새로고침 안 함")
-    if refresh_sec > 0:
-        st.experimental_set_query_params(_=datetime.now().timestamp())
-        st.autorefresh = st.experimental_rerun  # alias 느낌으로 남겨둠
-        st.experimental_memo.clear()  # 구버전 호환 무의미하지만 표시만
-
-# =============================
-# 마켓/선택
-# =============================
-markets_dict = get_markets()
-all_markets = list(markets_dict.keys())
-
-selected_markets = st.multiselect(
-    label="조회할 코인을 선택하세요:",
-    options=all_markets,
-    format_func=lambda x: f"{markets_dict.get(x, x)} ({x})",
-    default=[m for m in ["KRW-BTC", "KRW-ETH"] if m in all_markets],
-)
-
-if not selected_markets:
-    st.info("좌측/상단에서 코인을 선택해주세요.")
-    st.stop()
-
-# 차트에 표시할 기준 코인
-graph_market = st.selectbox(
-    "📊 차트를 표시할 코인:",
-    selected_markets,
-    format_func=lambda x: f"{markets_dict.get(x, x)} ({x})",
-)
-
-# 현재 시간 표시
-now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-st.markdown(f"<p style='font-size:13px;'>🕒 현재 시간: {now}</p>", unsafe_allow_html=True)
-
-# =============================
-# 레이아웃
-# =============================
-left_col, right_col = st.columns([2, 1])
-
-# 좌측: 캔들 차트
-with left_col:
-    df = get_candles(graph_market, chart_type, unit, candle_count)
-    st.markdown(
-        f"<h4>{markets_dict.get(graph_market, graph_market)} {interval_label} 캔들 차트</h4>",
-        unsafe_allow_html=True,
-    )
-
-    if not df.empty:
-        # 이동평균/거래량
-        for n in (5, 20, 60):
-            col_name = f"MA{n}"
-            df[col_name] = pd.Series(df["종가"]).rolling(n).mean()
-
-        fig = go.Figure()
-        fig.add_trace(
-            go.Candlestick(
-                x=df["시간"], open=df["시가"], high=df["고가"], low=df["저가"], close=df["종가"],
-                increasing_line_color='red', decreasing_line_color='blue', name="Candles"
-            )
-        )
-        fig.add_trace(go.Scatter(x=df["시간"], y=df["MA5"], mode="lines", name="MA5"))
-        fig.add_trace(go.Scatter(x=df["시간"], y=df["MA20"], mode="lines", name="MA20"))
-        fig.add_trace(go.Scatter(x=df["시간"], y=df["MA60"], mode="lines", name="MA60"))
-        fig.add_trace(
-            go.Bar(x=df["시간"], y=df["거래량"], name="Volume", opacity=0.3, yaxis="y2")
-        )
-        fig.update_layout(
-            xaxis_rangeslider_visible=False,
-            height=480,
-            margin=dict(l=10, r=10, t=30, b=10),
-            yaxis=dict(title="가격"),
-            yaxis2=dict(title="거래량", overlaying="y", side="right", showgrid=False),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        )
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-    else:
-        st.warning("차트 데이터를 가져올 수 없습니다.")
-
-# 우측: 시세/포트폴리오
-with right_col:
-    tickers_df = get_tickers_batch(selected_markets)
-    if tickers_df.empty:
-        st.error("시세 데이터를 불러오지 못했습니다.")
-    else:
-        # 사용자 보유 수량 입력 및 평가금액 계산
-        st.markdown("### 💼 포트폴리오 계산기")
-        total_eval = 0.0
-        for _, row in tickers_df.iterrows():
-            market = row["market"]
-            name = markets_dict.get(market, market)
-            current_price = row["현재가"]
-            prev_close = row["전일종가"]
-            change_rate = row["등락률(%)"]
-
-            color = "red" if (change_rate or 0) > 0 else "blue"
-            st.markdown(
-                f"""
-                <div style="background-color:#f8f9fa; padding:10px; margin-bottom:10px; border-radius:8px;">
-                <h5 style="margin:0 0 6px 0;">{name} ({market})</h5>
-                💰 현재가: <b>{fmt_number(current_price)} 원</b><br>
-                📈 전일 대비: <span style="color:{color}">{(change_rate or 0):+.2f}%</span>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            qty = st.number_input(
-                f"{name} 보유 수량",
-                min_value=0.0,
-                step=0.0001,
-                key=f"qty_{market}",
-            )
-            eval_amt = (qty or 0) * (current_price or 0)
-            total_eval += eval_amt
-            st.markdown(f"💼 평가 금액: <b>{fmt_number(eval_amt)} 원</b>", unsafe_allow_html=True)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        st.markdown(
-            f"<div style='background:#eef6ff;padding:12px;border-radius:8px;'>총 평가 금액: <b>{fmt_number(total_eval)} 원</b></div>",
-            unsafe_allow_html=True,
-        )
-
-# =============================
-# 부가: 테이블 보기
-# =============================
-with st.expander("🔎 시세 표로 보기"):
-    if 'tickers_df' in locals() and not tickers_df.empty:
-        view = tickers_df.copy()
-        view.insert(0, "종목명", view["market"].map(markets_dict).fillna(view["market"]))
-        view["현재가"] = view["현재가"].map(lambda x: f"{x:,.0f}")
-        view["전일종가"] = view["전일종가"].map(lambda x: f"{x:,.0f}")
-        view["등락률(%)"] = view["등락률(%)"].map(lambda x: f"{x:+.2f}%")
-        view["누적거래대금"] = view["누적거래대금"].map(lambda x: f"{x:,.0f}")
-        view["누적거래량"] = view["누적거래량"].map(lambda x: f"{x:,.4f}")
-        st.dataframe(view, use_container_width=True, hide_index=True)
-    else:
-        st.write("표시할 데이터가 없습니다.")
-
-# =============================
-# 노트/가이드
-# =============================
-with st.expander("ℹ️ 참고 (개발 가이드)"):
-    st.markdown(
+    @staticmethod
+    def _flatten(d: Dict[str, Any], parent_key: str = "", sep: str = "") -> Dict[str, Any]:
+        """중첩 dict 방지용 간단 플래튼 (values가 list인 경우 doseq로 처리)
+        Upbit 파라미터는 대부분 1-depth이므로 기본 그대로 반환.
         """
-        - **호출 최적화**: 티커는 다중 종목을 한 번에 조회해 API 호출 수를 줄였습니다.
-        - **안정성**: HTTP 재시도/타임아웃, 상태코드 에러 처리 추가.
-        - **성능**: `@st.cache_data`를 활용해 빈번한 동일 요청 캐시 (티커 3초, 캔들 30초, 마켓 1시간).
-        - **차트**: MA5/20/60, 거래량 이중축 추가. 차트 설정은 필요 시 조정하세요.
-        - **자동 새로고침**: 사이드바에서 간격 설정(초). 0이면 미사용.
-        - **확장 아이디어**:
-            1) 업비트 WebSocket을 이용한 초실시간 체결/호가 반영
-            2) 손익(P/L) 계산(평단가/수수료 입력) 및 포트폴리오 저장(`st.session_state`)
-            3) 알림(가격 도달, 변동률) 및 백테스트용 지표 추가(RSI, MACD 등)
-        """
-    )
+        return d
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        private: bool = False,
+        send_json_for_post: bool = True,
+    ) -> Any:
+        url = f"{self.base_url}{path}"
+        headers: Dict[str, str] = {}
+        if private:
+            headers.update(self._jwt_headers(params or {}))
+
+        # 요청 전송
+        try:
+            if method in ("GET", "DELETE"):
+                resp = self.session.request(
+                    method, url, params=params, headers=headers, timeout=self.timeout
+                )
+            else:  # POST/PUT
+                if send_json_for_post:
+                    headers.setdefault("Content-Type", "application/json")
+                    resp = self.session.request(
+                        method, url, json=params or {}, headers=headers, timeout=self.timeout
+                    )
+                else:
+                    # 일부 환경에서 application/x-www-form-urlencoded 를 선호할 경우
+                    resp = self.session.request(
+                        method, url, data=params or {}, headers=headers, timeout=self.timeout
+                    )
+        except requests.RequestException as e:
+            raise RuntimeError(f"HTTP 요청 실패: {e}")
+
+        # 오류 처리
+        if resp.status_code >= 400:
+            try:
+                payload = resp.json()
+            except Exception:
+                payload = resp.text
+            raise UpbitAPIError(resp.status_code, payload)
+
+        # JSON 파싱
+        if resp.headers.get("Content-Type", "").startswith("application/json"):
+            return resp.json()
+        # 텍스트/기타
+        return resp.text
+
+    # =============== 퍼블릭(시세) API ===============
+    def market_all(self) -> List[Dict[str, Any]]:
+        """마켓 목록 조회 (/v1/market/all)"""
+        return self._request("GET", "/v1/market/all")
+
+    def ticker(self, markets: Union[str, Iterable[str]]) -> List[Dict[str, Any]]:
+        """개별/복수 마켓 현재가 (/v1/ticker)"""
+        if not isinstance(markets, str):
+            markets = ",".join(markets)
+        return self._request("GET", "/v1/ticker", params={"markets": markets})
+
+    def ticker_by_quotes(self, quote_currencies: Union[str, Iterable[str]]) -> List[Dict[str, Any]]:
+        """호가통화 기준 전체 티커 스냅샷 (/v1/ticker/all)"""
+        if not isinstance(quote_currencies, str):
+            quote_currencies = ",".join(quote_currencies)
+        return self._request("GET", "/v1/ticker/all", params={"quoteCurrencies": quote_currencies})
+
+    def orderbook(self, markets: Union[str, Iterable[str]], level: Optional[float] = None) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {}
+        if not isinstance(markets, str):
+            markets = ",".join(markets)
+        params["markets"] = markets
+        if level is not None:
+            params["level"] = level
+        return self._request("GET", "/v1/orderbook", params=params)
+
+    def supported_orderbook_levels(self) -> List[Dict[str, Any]]:
+        return self._request("GET", "/v1/orderbook/supported_levels")
+
+    def trades_ticks(
+        self,
+        market: str,
+        *,
+        to: Optional[str] = None,
+        count: Optional[int] = None,
+        cursor: Optional[str] = None,
+        daysAgo: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {"market": market}
+        if to: params["to"] = to
+        if count: params["count"] = count
+        if cursor: params["cursor"] = cursor
+        if daysAgo: params["daysAgo"] = daysAgo
+        return self._request("GET", "/v1/trades/ticks", params=params)
+
+    def candles_minutes(self, unit: int, market: str, *, to: Optional[str] = None, count: Optional[int] = None) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {"market": market}
+        if to: params["to"] = to
+        if count: params["count"] = count
+        return self._request("GET", f"/v1/candles/minutes/{unit}", params=params)
+
+    def candles_days(self, market: str, *, to: Optional[str] = None, count: Optional[int] = None, convertingPriceUnit: Optional[str] = None) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {"market": market}
+        if to: params["to"] = to
+        if count: params["count"] = count
+        if convertingPriceUnit: params["convertingPriceUnit"] = convertingPriceUnit
+        return self._request("GET", "/v1/candles/days", params=params)
+
+    def candles_weeks(self, market: str, *, to: Optional[str] = None, count: Optional[int] = None) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {"market": market}
+        if to: params["to"] = to
+        if count: params["count"] = count
+        return self._request("GET", "/v1/candles/weeks", params=params)
+
+    def candles_months(self, market: str, *, to: Optional[str] = None, count: Optional[int] = None) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {"market": market}
+        if to: params["to"] = to
+        if count: params["count"] = count
+        return self._request("GET", "/v1/candles/months", params=params)
+
+    def candles_years(self, market: str, *, to: Optional[str] = None, count: Optional[int] = None) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {"market": market}
+        if to: params["to"] = to
+        if count: params["count"] = count
+        return self._request("GET", "/v1/candles/years", params=params)
+
+    # =============== 사설(계정/주문/입출금) API ===============
+    def accounts(self) -> List[Dict[str, Any]]:
+        """보유 자산 조회 (/v1/accounts)"""
+        return self._request("GET", "/v1/accounts", private=True)
+
+    def orders_chance(self, market: str) -> Dict[str, Any]:
+        return self._request("GET", "/v1/orders/chance", params={"market": market}, private=True)
+
+    # ----- 주문 -----
+    def place_order(
+        self,
+        *,
+        market: str,
+        side: str,  # 'bid' or 'ask'
+        ord_type: str,  # 'limit' | 'price' | 'market' | 'best'
+        volume: Optional[Union[str, float]] = None,
+        price: Optional[Union[str, float]] = None,
+        identifier: Optional[str] = None,
+        time_in_force: Optional[str] = None,  # 'ioc' | 'fok' | 'post_only'
+        smp_type: Optional[str] = None,       # 'reduce' | 'cancel_maker' | 'cancel_taker'
+    ) -> Dict[str, Any]:
+        if not self.enable_trading:
+            raise PermissionError("enable_trading=True 로 생성해야 주문이 활성화됩니다.")
+        params: Dict[str, Any] = {
+            "market": market,
+            "side": side,
+            "ord_type": ord_type,
+        }
+        if volume is not None:
+            params["volume"] = str(volume)
+        if price is not None:
+            params["price"] = str(price)
+        if identifier:
+            params["identifier"] = identifier
+        if time_in_force:
+            params["time_in_force"] = time_in_force
+        if smp_type:
+            params["smp_type"] = smp_type
+        return self._request("POST", "/v1/orders", params=params, private=True)
+
+    def cancel_order(self, *, uuid: Optional[str] = None, identifier: Optional[str] = None) -> Dict[str, Any]:
+        if not self.enable_trading:
+            raise PermissionError("enable_trading=True 로 생성해야 취소가 활성화됩니다.")
+        if not uuid and not identifier:
+            raise ValueError("uuid 또는 identifier 중 하나는 필요합니다.")
+        params: Dict[str, Any] = {}
+        if uuid: params["uuid"] = uuid
+        if identifier: params["identifier"] = identifier
+        # DELETE 는 쿼리스트링 사용
+        return self._request("DELETE", "/v1/order", params=params, private=True)
+
+    def order(self, *, uuid: Optional[str] = None, identifier: Optional[str] = None) -> Dict[str, Any]:
+        params: Dict[str, Any] = {}
+        if uuid: params["uuid"] = uuid
+        if identifier: params["identifier"] = identifier
+        return self._request("GET", "/v1/order", params=params, private=True)
+
+    def orders_open(self, *, market: Optional[str] = None, state: Optional[str] = None, states: Optional[List[str]] = None, page: Optional[int] = None, limit: Optional[int] = None, order_by: Optional[str] = None) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {}
+        if market: params["market"] = market
+        if state: params["state"] = state
+        if states: params["states"] = states
+        if page: params["page"] = page
+        if limit: params["limit"] = limit
+        if order_by: params["order_by"] = order_by
+        return self._request("GET", "/v1/orders/open", params=params, private=True)
+
+    def orders_closed(self, *, market: Optional[str] = None, state: Optional[str] = None, states: Optional[List[str]] = None, start_time: Optional[str] = None, end_time: Optional[str] = None, limit: Optional[int] = None, order_by: Optional[str] = None, page: Optional[int] = None) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {}
+        if market: params["market"] = market
+        if state: params["state"] = state
+        if states: params["states"] = states
+        if start_time: params["start_time"] = start_time
+        if end_time: params["end_time"] = end_time
+        if limit: params["limit"] = limit
+        if order_by: params["order_by"] = order_by
+        if page: params["page"] = page
+        return self._request("GET", "/v1/orders/closed", params=params, private=True)
+
+    def orders_by_ids(self, *, market: Optional[str] = None, uuids: Optional[List[str]] = None, identifiers: Optional[List[str]] = None, order_by: Optional[str] = None) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {}
+        if market: params["market"] = market
+        if uuids: params["uuids"] = uuids
+        if identifiers: params["identifiers"] = identifiers
+        if order_by: params["order_by"] = order_by
+        return self._request("GET", "/v1/orders/uuids", params=params, private=True)
+
+    def cancel_orders_batch(self, *, market: str, count: int, order_by: str = "desc") -> Dict[str, Any]:
+        if not self.enable_trading:
+            raise PermissionError("enable_trading=True 로 생성해야 취소가 활성화됩니다.")
+        params = {"market": market, "count": count, "order_by": order_by}
+        return self._request("DELETE", "/v1/orders", params=params, private=True)
+
+    def cancel_orders_list(self, *, market: str, uuids: Optional[List[str]] = None, identifiers: Optional[List[str]] = None) -> Dict[str, Any]:
+        if not self.enable_trading:
+            raise PermissionError("enable_trading=True 로 생성해야 취소가 활성화됩니다.")
+        params: Dict[str, Any] = {"market": market}
+        if uuids: params["uuids"] = uuids
+        if identifiers: params["identifiers"] = identifiers
+        return self._request("DELETE", "/v1/orders/list", params=params, private=True)
+
+    # ----- 출금 / 입금 -----
+    def withdraws(self, **kwargs) -> List[Dict[str, Any]]:
+        """출금 목록 조회 (/v1/withdraws) — kwargs로 상태/마켓/페이징 등 전달"""
+        return self._request("GET", "/v1/withdraws", params=kwargs or None, private=True)
+
+    def withdraw(self, *, currency: str, amount: Union[str, float], address: str, net_type: Optional[str] = None, secondary_address: Optional[str] = None) -> Dict[str, Any]:
+        if not self.enable_trading:
+            raise PermissionError("enable_trading=True 로 생성해야 출금이 활성화됩니다.")
+        params: Dict[str, Any] = {
+            "currency": currency,
+            "amount": str(amount),
+            "address": address,
+        }
+        if net_type: params["net_type"] = net_type
+        if secondary_address: params["secondary_address"] = secondary_address
+        return self._request("POST", "/v1/withdraws/coin", params=params, private=True)
+
+    def withdraw_krw(self, *, amount: Union[str, float]) -> Dict[str, Any]:
+        if not self.enable_trading:
+            raise PermissionError("enable_trading=True 로 생성해야 출금이 활성화됩니다.")
+        params = {"amount": str(amount)}
+        return self._request("POST", "/v1/withdraws/krw", params=params, private=True)
+
+    def withdraw_allowlisted_addresses(self) -> List[Dict[str, Any]]:
+        return self._request("GET", "/v1/withdraws/coin_addresses", private=True)
+
+    def deposits(self, **kwargs) -> List[Dict[str, Any]]:
+        return self._request("GET", "/v1/deposits", params=kwargs or None, private=True)
+
+    def deposit(self, *, amount: Union[str, float]) -> Dict[str, Any]:
+        """원화(KRW) 입금 요청(일부 계정/등급에서만 지원)."""
+        params = {"amount": str(amount)}
+        return self._request("POST", "/v1/deposits/krw", params=params, private=True)
+
+    def generate_deposit_address(self, *, currency: str, net_type: Optional[str] = None) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"currency": currency}
+        if net_type: params["net_type"] = net_type
+        return self._request("POST", "/v1/deposits/generate_coin_address", params=params, private=True)
+
+    def deposit_address(self, *, currency: Optional[str] = None, net_type: Optional[str] = None) -> Dict[str, Any]:
+        params: Dict[str, Any] = {}
+        if currency: params["currency"] = currency
+        if net_type: params["net_type"] = net_type
+        return self._request("GET", "/v1/deposits/coin_addresses", params=params, private=True)
+
+    def deposit_address_by_uuid(self, *, uuid: str) -> Dict[str, Any]:
+        return self._request("GET", "/v1/deposits/coin_address", params={"uuid": uuid}, private=True)
+
+    def deposit_verify_by_uuid(self, *, uuid: str) -> Dict[str, Any]:
+        return self._request("POST", "/v1/deposits/verify", params={"uuid": uuid}, private=True)
+
+    def deposit_verify_by_txid(self, *, txid: str, currency: str) -> Dict[str, Any]:
+        return self._request("POST", "/v1/deposits/verify_txid", params={"txid": txid, "currency": currency}, private=True)
+
+    def deposit_available_info(self, *, currency: str) -> Dict[str, Any]:
+        return self._request("GET", "/v1/deposits/coin_availability", params={"currency": currency}, private=True)
+
+    # ----- 기타(지갑/키) -----
+    def wallet_status(self) -> List[Dict[str, Any]]:
+        return self._request("GET", "/v1/status/wallet")
+
+    def api_keys(self) -> List[Dict[str, Any]]:
+        return self._request("GET", "/v1/api_keys", private=True)
+
+    # =============== WebSocket ===============
+    class _WS:
+        def __init__(self, url: str, headers: Dict[str, str]):
+            if websocket is None:
+                raise RuntimeError("websocket-client 패키지가 필요합니다: pip install websocket-client")
+            self.url = url
+            self.headers = [f"{k}: {v}" for k, v in headers.items()]
+            self._app = None
+
+        def run(
+            self,
+            messages: List[Dict[str, Any]],
+            on_message: Optional[Callable[[bytes], None]] = None,
+            on_open: Optional[Callable[[Any], None]] = None,
+            on_error: Optional[Callable[[Any, Exception], None]] = None,
+            on_close: Optional[Callable[[Any, int, str], None]] = None,
+            ping_interval: int = 15,
+        ) -> None:
+            def _on_message(ws, msg: bytes):
+                if on_message:
+                    on_message(msg)
+                else:
+                    print(msg if isinstance(msg, (bytes, bytearray)) else str(msg))
+
+            def _on_open(ws):
+                if on_open:
+                    on_open(ws)
+                # 구독 요청 전송
+                ws.send(json.dumps(messages))
+
+            app = websocket.WebSocketApp(
+                self.url,
+                header=self.headers,
+                on_message=_on_message,
+                on_open=_on_open,
+                on_error=on_error,
+                on_close=on_close,
+            )
+            self._app = app
+            app.run_forever(ping_interval=ping_interval)
+
+    def ws_public(self) -> "UpbitClient._WS":
+        headers = {}  # 퍼블릭은 헤더 불필요
+        return self._WS("wss://api.upbit.com/websocket/v1", headers)
+
+    def ws_private(self) -> "UpbitClient._WS":
+        headers = self._jwt_headers({})
+        return self._WS("wss://api.upbit.com/websocket/v1/private", headers)
+
+    # 헬퍼: 구독 메시지 빌더
+    @staticmethod
+    def ws_build_request(
+        *,
+        types: List[Dict[str, Any]],  # 예: [{"type": "ticker", "codes": ["KRW-BTC"]}]
+        ticket: Optional[str] = None,
+        format_: str = "DEFAULT",  # 또는 "SIMPLE"
+    ) -> List[Dict[str, Any]]:
+        msg: List[Dict[str, Any]] = []
+        msg.append({"ticket": ticket or str(uuid.uuid4())})
+        msg.extend(types)
+        msg.append({"format": format_})
+        return msg
+
+
+# ================= 예시 사용법 =================
+if __name__ == "__main__":
+    # 환경변수로 키를 넣었다고 가정
+    client = UpbitClient(UpbitClientConfig(enable_trading=False))
+
+    # 퍼블릭 예시
+    markets = client.market_all()
+    print("마켓수:", len(markets))
+    print("KRW 마켓 예시:", [m for m in markets if m["market"].startswith("KRW-")][:3])
+
+    # 캔들/호가/체결
+    print("분봉 1분 KRW-BTC 5개:", client.candles_minutes(1, "KRW-BTC", count=5)[0])
+    print("호가 KRW-BTC:", client.orderbook("KRW-BTC")[0]["market"])
+    print("최근 체결 KRW-BTC 3개:", client.trades_ticks("KRW-BTC", count=3)[0])
+
+    # 사설(계좌)
+    if client.access_key and client.secret_key:
+        print("보유자산 샘플:", client.accounts()[:1])
+        print("주문가능정보 샘플:", client.orders_chance("KRW-BTC")["market"]["id"])  # 권한/등급 필요
+
+    # WebSocket 퍼블릭 구독 (실행 예)
+    # ws = client.ws_public()
+    # sub = client.ws_build_request(types=[{"type": "ticker", "codes": ["KRW-BTC", "KRW-ETH"]}], format_="SIMPLE")
+    # ws.run(messages=sub)
+
+    # WebSocket 프라이빗 구독 (myOrder/myAsset)
+    # ws_p = client.ws_private()
+    # sub_p = client.ws_build_request(types=[{"type": "myOrder"}, {"type": "myAsset"}], format_="DEFAULT")
+    # ws_p.run(messages=sub_p)
